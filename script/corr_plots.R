@@ -198,11 +198,6 @@ p_corr_adults <- ggcorrplot(adults_corr_mat,
 print(p_corr_adults)
 dev.off()
 
-###
-# dist_matrix <- as.dist(1 - corr_matrix) 
-# hc_result <- hclust(dist_matrix)
-# fixed_variable_order <- rownames(corr_matrix)[hc_result$order]
-
 ### Combine plots
 message("Combining plots with patchwork...")
 
