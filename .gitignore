@@ -61,4 +61,5 @@ rsconnect/
 # not relevant files
 old/*
 ebm/*
+tests/*
 AGENTS.md
