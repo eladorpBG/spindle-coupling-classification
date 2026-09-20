@@ -1,18 +1,19 @@
-# Random-search tuning for the manuscript's XGBoost models.
+# Random-search tuning for adult and child manuscript XGBoost models.
 
 library(xgboost)
 library(splitstackshape)
 library(zoo)
 
-## RStudio settings ------------------------------------------------------------
+## RStudio settings ----
 
-COHORT <- "adults"               # "adults", "children", or "both"
-DATA_DIR <- "."                  # Or an absolute path, e.g. "~/spindles"
+# Choose adults, children, or both; set DATA_DIR to the input CSV directory.
+COHORT <- "adults"
+DATA_DIR <- "."
 OUTPUT_DIR <- file.path(DATA_DIR, "results", "tuning")
 N_TRIALS <- 50
 SEED <- 123
 
-## Preprocessing ---------------------------------------------------------------
+## Preprocessing ----
 
 prepare_tuning_data <- function(data, cohort = c("adults", "children")) {
   cohort <- match.arg(cohort)
@@ -32,7 +33,7 @@ prepare_tuning_data <- function(data, cohort = c("adults", "children")) {
     stop("refrPeriod and peakLoc must be numeric.")
   }
 
-  # Remove occipital channels and normalize references.
+  # Exclude occipital channels and remove mastoid references.
   data$coupling_label <- factor(data$coupling_label, levels = c(0, 1))
   data <- data[!grepl("O", data$channel), , drop = FALSE]
   if (nrow(data) == 0) stop("No spindles remain after channel filtering.")
@@ -46,7 +47,7 @@ prepare_tuning_data <- function(data, cohort = c("adults", "children")) {
 }
 
 make_tuning_matrix <- function(data) {
-  # Select predictors by name, independent of input column order.
+  # Select numeric predictors by name, regardless of input column order.
   metadata <- c("ID", "row_id", "patient_id", "spindle_idx", "detSample",
                 "startSample", "endSample", "Cohort", "channel", "coupling_label")
   predictors <- setdiff(names(data)[vapply(data, is.numeric, logical(1))], metadata)
@@ -54,7 +55,7 @@ make_tuning_matrix <- function(data) {
   as.matrix(data[, predictors, drop = FALSE])
 }
 
-## Search and output -----------------------------------------------------------
+## Search and output ----
 
 sample_tuning_params <- function() {
   list(
@@ -70,7 +71,7 @@ sample_tuning_params <- function() {
 }
 
 write_tuning_results <- function(results, output_file) {
-  # Manuscript scripts expect these two names as the final columns.
+  # Keep the CSV column names expected by the manuscript evaluation scripts.
   export <- results
   names(export)[names(export) == "cv_auc"] <- "as.numeric(score[1])"
   names(export)[names(export) == "best_iteration"] <- "as.numeric(score[2])"
@@ -109,7 +110,7 @@ tune_xgboost_params <- function(cohort = c("adults", "children", "both"),
          ". Check data_dir (DATA_DIR in the RStudio settings).", call. = FALSE)
   }
 
-  # Validate the output destination before starting the tuning search.
+  # Check the output destination before running the search.
   output_dir <- path.expand(output_dir)
   if (!dir.exists(output_dir) && !dir.create(output_dir, recursive = TRUE)) {
     stop("Cannot create output directory: ", output_dir, call. = FALSE)
@@ -127,7 +128,7 @@ tune_xgboost_params <- function(cohort = c("adults", "children", "both"),
   data <- prepare_tuning_data(read.csv(input_file), cohort)
   set.seed(seed)
 
-  # A 66% sample within each label/patient stratum, followed by row-level five-fold CV.
+  # Sample 66% within each label and patient stratum, then use row-level five-fold CV.
   split <- splitstackshape::stratified(
     data, c("coupling_label", "patient_id"), size = 0.66, bothSets = TRUE
   )
@@ -143,7 +144,7 @@ tune_xgboost_params <- function(cohort = c("adults", "children", "both"),
   trials <- vector("list", n_trials)
   for (i in seq_len(n_trials)) {
     params <- sample_tuning_params()
-    # nrounds controls CV; booster and class weight are model parameters.
+    # Pass nrounds to CV separately from the model parameters.
     cv_params <- params[names(params) != "nrounds"]
     cv_params$booster <- "dart"
     cv_params$scale_pos_weight <- imbalance_weight
@@ -178,7 +179,7 @@ tune_xgboost_params <- function(cohort = c("adults", "children", "both"),
   invisible(results)
 }
 
-## Run -------------------------------------------------------------------------
+## Run ----
 
 tuning_results <- tune_xgboost_params(
   cohort = COHORT,

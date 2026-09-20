@@ -98,7 +98,7 @@ Use RStudio Server with the repository root as the working directory. In the Con
 
 With both cohort CSVs and tuning results available, source `script/LOSO.R` for pooled evaluation. To generate the cohort comparison and SHAP summary, then source `script/ChildvsAdult.R` followed by `script/shap.R` in the same session. `shap.R` reads `ChildvsAdults_shap_values.rds` produced by the cohort comparison.
 
-Then, source `script/CvsF.R` and `script/3vs4.R` separately for electrode comparisons. Both currently use the adult cohort and set `APPLY_FILTER <- FALSE` for overlap filtering.
+For electrode comparisons, open `script/CvsF.R` or `script/3vs4.R`, set `COHORT` to `"adults"` or `"children"`, and click Source. Results go to `results/`; set `TUNING_DIR <- "results/tuning"` if using new tuning outputs. Run each cohort separately; both scripts default to adults and leave overlap filtering off.
 
 ### Descriptive statistics and feature means
 

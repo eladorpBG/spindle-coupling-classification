@@ -1,3 +1,5 @@
+# Compare central and frontal channel XGBoost models within one cohort.
+
 library(ggpubr)
 library(readr)
 library(rstatix)
@@ -18,10 +20,29 @@ library(dplyr)
 library(data.table)
 library(igraph)
 
-set.seed(123)
+## RStudio settings ----
+
+# Select "adults" or "children".
+COHORT <- "adults"
+DATA_DIR <- "."
+TUNING_DIR <- "."
+OUTPUT_DIR <- "results"
 APPLY_FILTER <- FALSE
 ADULT_SAMP_FREQ <- 200
 CHILD_SAMP_FREQ <- 256
+set.seed(123)
+
+COHORT <- match.arg(COHORT, c("adults", "children"))
+INPUT_FILE <- file.path(path.expand(DATA_DIR), paste0(COHORT, "_data_2025.csv"))
+TUNING_FILE <- file.path(path.expand(TUNING_DIR), paste0("tuning_results_", COHORT, ".csv"))
+METRICS_FILE <- file.path(path.expand(OUTPUT_DIR), paste0(COHORT, "_cvsf_subject_metrics.rds"))
+FIGURE_FILE <- file.path(path.expand(OUTPUT_DIR), paste0("combined_", COHORT, "_cvsf_heatmaps.png"))
+
+if (!file.exists(INPUT_FILE)) stop("Input file not found: ", INPUT_FILE)
+if (!file.exists(TUNING_FILE)) stop("Tuning file not found: ", TUNING_FILE)
+if (!dir.exists(path.expand(OUTPUT_DIR))) stop("Output directory not found: ", OUTPUT_DIR)
+
+## Evaluation helpers ----
 
 eval_model_roc <- function(model, test_mat, test_labels){
   xgb_preds <- predict(model, test_mat, reshape = TRUE)
@@ -31,21 +52,15 @@ eval_model_roc <- function(model, test_mat, test_labels){
 }
 
 eval_model_pr <- function(model, test_mat, test_labels){
-  # 1. Get predictions
   xgb_preds <- predict(model, test_mat, reshape = TRUE)
-  
-  
-  # 3. Calculate PR AUC
-  # Note: If test_labels is already a 0/1 numeric vector (standard for xgboost), 
-  # you don't need the `as.numeric() - 1`. If it's a factor, keep it.
-  # I've used test_labels directly here assuming it's numeric.
+
+  # Factor labels are converted to 0/1 weights for PR AUC.
   pr_result <- pr.curve(
     scores.class0 = xgb_preds, 
     weights.class0 = as.numeric(test_labels) - 1, 
     curve = TRUE
   )
-  
-  # 6. Return just the AUC metric
+
   return(pr_result$auc.integral)
 }
 print_confusion_mat <- function(xgb_preds, test_labels){
@@ -69,13 +84,12 @@ print_AUC_plot_ROC <- function(xgb_preds, test_labels){
 }
 
 get_ci_from_ttest <- function(x) {
-  # Ensure there are at least 2 data points to perform a test
   if (length(na.omit(x)) < 2) {
     return(c(mean = mean(x), lower_ci = NA, upper_ci = NA))
   }
-  
+
   test <- t.test(x)
-  
+
   return(c(
     mean = unname(test$estimate),
     lower_ci = test$conf.int[1],
@@ -83,43 +97,37 @@ get_ci_from_ttest <- function(x) {
   ))
 }
 
-data4elec <- read.csv("~/spindles/adults_data_2025.csv")
-samp_freq <- ADULT_SAMP_FREQ
+## Load and preprocess data ----
 
+data4elec <- read.csv(INPUT_FILE)
+samp_freq <- c(adults = ADULT_SAMP_FREQ, children = CHILD_SAMP_FREQ)[[COHORT]]
 
-# 1. Setup: Sort and assign unique ID
 data4elec <- data4elec %>% 
   arrange(patient_id, startSample) %>% 
   mutate(row_id = row_number())
 
-# 2. Convert to data.table for interval matching
 dt <- as.data.table(data4elec)
 setkey(dt, patient_id, startSample, endSample)
 
-# 3. Find Overlaps (Strict: Any overlap > 0 counts)
-# 'type = "any"' ensures if events touch even slightly, they are matched
 overlaps <- foverlaps(dt, dt, type = "any", which = FALSE)
 
-# 4. Filter for valid pairs (remove self-matches)
 valid_links <- overlaps[row_id < i.row_id, .(row_id, i.row_id)]
 
-# 5. Graph Clustering
-# Group all connected events (A touches B, B touches C -> all one cluster)
+# Connected overlaps share a cluster for optional event filtering.
 g <- graph_from_data_frame(valid_links, directed = FALSE, vertices = data4elec$row_id)
 comps <- components(g)
 
 if (APPLY_FILTER) {
-  # 6. Apply Filter
+  # When enabled, retain one event per patient and overlap cluster.
   df_filtered <- data4elec %>%
-    mutate(cluster_id = comps$membership) %>%  # Assign Cluster IDs
-    group_by(patient_id, cluster_id) %>%       # Group by Patient and Cluster
-    slice_sample(n = 1) %>%                    # Randomly keep 1 per group
+    mutate(cluster_id = comps$membership) %>%
+    group_by(patient_id, cluster_id) %>%
+    slice_sample(n = 1) %>%
     ungroup() %>%
-    select(-cluster_id, -row_id)               # Remove helper columns
+    select(-cluster_id, -row_id)
 } else {
   df_filtered <- data4elec
 }
-# View result
 cat("Original rows:", nrow(data4elec), "\n")
 cat("Filtered rows:", nrow(df_filtered), "\n")
 
@@ -128,20 +136,23 @@ data4elec$coupling_label <- as.factor(data4elec$coupling_label)
 data4elec <- subset(data4elec, !grepl("O", channel))
 data4elec$channel <- ifelse(grepl("F", data4elec$channel), "F", data4elec$channel)
 data4elec$channel <- ifelse(grepl("C", data4elec$channel), "C", data4elec$channel)
+if (!all(c("F", "C") %in% data4elec$channel) ||
+    any(!(data4elec$channel %in% c("F", "C")))) {
+  stop("Expected frontal and central channels after preprocessing.")
+}
 data4elec <- tibble::rowid_to_column(data4elec, "ID")
 data4elec$refrPeriod <- na.aggregate(data4elec$refrPeriod, by = data4elec$patient_id)
 data4elec <- subset(data4elec, select= -numCycles)
 data4elec$peakLoc <- data4elec$peakLoc / samp_freq
 
-# Number of folds for cross-validation
+## Grouped cross-validation ----
+
 k <- 10
 folds <- rsample::group_vfold_cv(data4elec, group = patient_id, v = k)
 
-# Create an empty matrix for AUC values
 final_auc_mat <- matrix(0, nrow = 3, ncol = 3)
 
-tuning_results_adults <- read_csv("~/spindles/tuning_results_adults.csv")
-tune_results <- tuning_results_adults
+tune_results <- read_csv(TUNING_FILE)
 
 max_score_idx = which.max(tune_results$`as.numeric(score[1])`)
 best_params <- tune_results[max_score_idx,-(ncol(tune_results)-1)]
@@ -152,18 +163,16 @@ all_oof_preds <- data.frame()
 
 for (i in 1:k) {
   cat("Processing fold", i, "\n")
-  
-  # Get the specific split object for the i-th fold
+
   current_split <- folds$splits[[i]]
-  
-  # Get train and test indices from the split object
+
   train_indices <- current_split$in_id
   test_indices <- setdiff(all_indices, train_indices)
-  
+
   data4model <- data4elec[ , !names(data4elec) %in% c("patient_id", "spindle_idx", "ID", "detSample", "startSample", "endSample")]
   train4elec <- data4model[train_indices, ]
   test4elec <- data4model[test_indices, ]
-  
+
   F_train <- train4elec[train4elec$channel == "F", ]
   C_train <-train4elec[train4elec$channel == "C", ]
   min_samples <- min(nrow(train4elec), nrow(F_train), nrow(C_train))
@@ -175,34 +184,30 @@ for (i in 1:k) {
   C_train <- C_train[C_inds,]
   F_test <- test4elec[test4elec$channel == "F", ]
   C_test <- test4elec[test4elec$channel == "C", ]
-  
-  # Keep track of patient IDs for the test sets
+
   test_patient_ids_all <- data4elec$patient_id[test_indices]
   test_patient_ids_F <- test_patient_ids_all[test4elec$channel == "F"]
   test_patient_ids_C <- test_patient_ids_all[test4elec$channel == "C"]
-  
-  ## Classification model - XGBoost
-  
+
   all_train_mat <- as.matrix(all_train[,sapply(all_train, is.numeric)])
   F_train_mat <- as.matrix(F_train[,sapply(F_train, is.numeric)])
   C_train_mat <- as.matrix(C_train[,sapply(C_train, is.numeric)])
-  
+
   all_test_mat <- as.matrix(test4elec[,sapply(test4elec, is.numeric)])
   F_test_mat <- as.matrix(F_test[,sapply(F_test, is.numeric)])
   C_test_mat <- as.matrix(C_test[,sapply(C_test, is.numeric)])
-  
+
   xgb_all_train <-  xgb.DMatrix(data = all_train_mat, label = as.numeric(all_train$coupling_label) -1)
   xgb_F_train <- xgb.DMatrix(data = F_train_mat, label = as.numeric(F_train$coupling_label) -1)
   xgb_C_train <- xgb.DMatrix(data = C_train_mat, label = as.numeric(C_train$coupling_label) -1)
   xgb_all_test <-  xgb.DMatrix(data = all_test_mat, label = as.numeric(test4elec$coupling_label) -1)
   xgb_F_test <- xgb.DMatrix(data = F_test_mat, label = as.numeric(F_test$coupling_label) -1)
   xgb_C_test <- xgb.DMatrix(data = C_test_mat, label = as.numeric(C_test$coupling_label) -1)
-  
+
   imbalance_weight_all <-  sum(all_train$coupling_label == 0) / sum(all_train$coupling_label == 1)
   imbalance_weight_F <- sum(F_train$coupling_label == 0) / sum(F_train$coupling_label == 1)
   imbalance_weight_C <- sum(C_train$coupling_label == 0) / sum(C_train$coupling_label == 1)
-  
-  ## Train model 
+
   xgb_model_all <- xgb.train(
     params = best_params_list,
     data = xgb_all_train,
@@ -210,7 +215,7 @@ for (i in 1:k) {
     verbose = 1,
     scale_pos_weight = imbalance_weight_all
   )
-  
+
   xgb_model_F <- xgb.train(
     params = best_params_list,
     data = xgb_F_train,
@@ -225,25 +230,20 @@ for (i in 1:k) {
     verbose = 1,
     scale_pos_weight = imbalance_weight_C
   )
-  
-  
-  # Define models and datasets in lists for looping
+
   model_names <- c("All", "F", "C")
   models <- list(xgb_model_all, xgb_model_F, xgb_model_C)
-  
+
   datasets <- list(
     list(name = "All", data = xgb_all_test, labels = test4elec$coupling_label, pids = test_patient_ids_all),
     list(name = "F", data = xgb_F_test, labels = F_test$coupling_label, pids = test_patient_ids_F),
     list(name = "C", data = xgb_C_test, labels = C_test$coupling_label, pids = test_patient_ids_C)
   )
-  
-  # Fill the out-of-fold prediction dataframe
+
   for (l in seq_along(models)) {
     for (j in seq_along(datasets)) {
-      # Generate predictions
       preds <- predict(models[[l]], datasets[[j]]$data, reshape = TRUE)
-      
-      # Create tracking dataframe for this specific combination
+
       temp_df <- data.frame(
         patient_id = datasets[[j]]$pids,
         label = as.numeric(datasets[[j]]$labels) - 1,
@@ -251,23 +251,20 @@ for (i in 1:k) {
         train_model = model_names[l],
         test_set = datasets[[j]]$name
       )
-      
-      # Append to master dataframe
+
       all_oof_preds <- bind_rows(all_oof_preds, temp_df)
     }
   }
 }
 
-# ==============================================================================
-# CALCULATE PER-SUBJECT METRICS
-# ==============================================================================
+## Subject-level metrics ----
 
+# AUC is undefined for patients with only one outcome class.
 subject_metrics <- all_oof_preds %>%
   group_by(train_model, test_set, patient_id) %>%
   summarize(
     n_pos = sum(label == 1),
     n_neg = sum(label == 0),
-    # Only calculate if the subject has at least one example of both classes
     ROCAUC = if (n_pos > 0 && n_neg > 0) {
       as.numeric(pROC::auc(label, pred, quiet = TRUE))
     } else { NA_real_ },
@@ -277,14 +274,13 @@ subject_metrics <- all_oof_preds %>%
     .groups = "drop"
   )
 
-# 2. Identify and print skipped patients
 skipped_patients <- subject_metrics %>% filter(is.na(ROCAUC))
 
 if (nrow(skipped_patients) > 0) {
   cat("\n======================================================\n")
   cat(" WARNING: SKIPPED PATIENTS (Missing one or both classes)\n")
   cat("======================================================\n")
-  
+
   for (i in 1:nrow(skipped_patients)) {
     row <- skipped_patients[i, ]
     cat(sprintf("Skipped Patient ID: %-10s | Train: %-5s | Test: %-5s | Positives: %-3d | Negatives: %-3d\n", 
@@ -295,13 +291,11 @@ if (nrow(skipped_patients) > 0) {
   cat("\nAll patients successfully evaluated (no missing classes).\n\n")
 }
 
-# Optional: Save these per-subject metrics for your records
-saveRDS(subject_metrics, file = "adults_cvsf_subject_metrics.rds")
-# ==============================================================================
-# 1. HELPER FUNCTION: Clean data and rename to Central/Frontal
-# ==============================================================================
+saveRDS(subject_metrics, file = METRICS_FILE)
+
+## Summarize model comparisons ----
+
 process_auc_data_cvsf <- function(metrics_df, metric_col) {
-  # Group by model and test set, calculate CIs while ignoring NAs
   summary_df <- metrics_df %>%
     filter(!is.na(.data[[metric_col]])) %>%
     group_by(train_model, test_set) %>%
@@ -312,10 +306,9 @@ process_auc_data_cvsf <- function(metrics_df, metric_col) {
       .groups = "drop"
     ) %>%
     rename(Model = train_model, Test = test_set, !!metric_col := mean_val)
-  
-  # Rename to "Pooled", "Central", "Frontal" and enforce factor order
+
   desired_order <- c("Central", "Frontal", "Pooled")
-  
+
   summary_df <- summary_df %>%
     mutate(
       Model = case_when(
@@ -332,38 +325,28 @@ process_auc_data_cvsf <- function(metrics_df, metric_col) {
       )
     ) %>%
     mutate(
-      # rev() puts Pooled at the top of the Y-axis. 
       Model = factor(Model, levels = desired_order), 
       Test  = factor(Test, levels = desired_order)
     )
-  
+
   return(summary_df)
 }
 
-
-# ==============================================================================
-# 2. GENERATE PLOT DATA
-# ==============================================================================
-
-subject_metrics <- readRDS("adults_cvsf_subject_metrics.rds")
+subject_metrics <- readRDS(METRICS_FILE)
 
 auc_data_roc <- process_auc_data_cvsf(subject_metrics, "ROCAUC")
 auc_data_pr  <- process_auc_data_cvsf(subject_metrics, "PRAUC")
 
-# ==============================================================================
-# 3. BUILD INDIVIDUAL PLOTS (With Dual-Layer Text)
-# ==============================================================================
+## Plot model comparisons ----
 
-# --- Plot A: ROC AUC ---
 roc_plot <- ggplot(auc_data_roc, aes(x = Test, y = Model, fill = ROCAUC)) + 
   geom_tile(color = "white", linewidth = 1) + 
-  
-  # Dual-Layer Text trick
+
   geom_text(aes(label = sprintf("%.3f", ROCAUC)), 
             color = "white", size = 7, fontface = "bold", nudge_y = 0.15) + 
   geom_text(aes(label = sprintf("[%.3f - %.3f]", Lower_CI, Upper_CI)), 
             color = "white", size = 4.5, nudge_y = -0.15) + 
-  
+
   scale_fill_gradient(low = "#0072B2", high = "#D55E00", name = "ROC AUC", limits = c(0.5, 0.8)) +
   scale_x_discrete(expand = c(0, 0)) + 
   scale_y_discrete(expand = c(0, 0)) + 
@@ -380,17 +363,14 @@ roc_plot <- ggplot(auc_data_roc, aes(x = Test, y = Model, fill = ROCAUC)) +
     plot.margin = ggplot2::margin(10, 10, 10, 10) 
   )
 
-# --- Plot B: PR AUC ---
 pr_plot <- ggplot(auc_data_pr, aes(x = Test, y = Model, fill = PRAUC)) + 
   geom_tile(color = "white", linewidth = 1) + 
-  
-  # Dual-Layer Text trick
+
   geom_text(aes(label = sprintf("%.3f", PRAUC)), 
             color = "white", size = 7, fontface = "bold", nudge_y = 0.15) + 
   geom_text(aes(label = sprintf("[%.3f - %.3f]", Lower_CI, Upper_CI)), 
             color = "white", size = 4.5, nudge_y = -0.15) + 
-  
-  # Note: Adjust limits to c(0, 1) if PR AUC drops below 0.5
+
   scale_fill_gradient(low = "#0072B2", high = "#D55E00", name = "PR AUC", limits = c(0.1, 0.5)) +
   scale_x_discrete(expand = c(0, 0)) + 
   scale_y_discrete(expand = c(0, 0)) + 
@@ -407,13 +387,10 @@ pr_plot <- ggplot(auc_data_pr, aes(x = Test, y = Model, fill = PRAUC)) +
     plot.margin = ggplot2::margin(10, 10, 10, 10) 
   )
 
-# ==============================================================================
-# 4. COMBINE AND EXPORT WITH PATCHWORK
-# ==============================================================================
+## Export plots ----
+
 combined_plot <- roc_plot + pr_plot + 
-  plot_annotation(tag_levels = list(c('C', 'D'))) & # plot_annotation(tag_levels = 'A') &  
+  plot_annotation(tag_levels = list(c('C', 'D'))) &
   theme(plot.tag = element_text(size = 28, face = "bold"))
 
-# Save at manuscript dimensions
-ggsave("combined_adults_cvsf_heatmaps.png", plot = combined_plot, width = 18, height = 8, dpi = 300)
-
+ggsave(FIGURE_FILE, plot = combined_plot, width = 18, height = 8, dpi = 300)

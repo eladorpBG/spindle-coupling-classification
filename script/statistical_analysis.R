@@ -1,3 +1,5 @@
+# Summarize adult and child spindle features and export manuscript tables and plots.
+
 library(ggpubr)
 library(rstatix)
 library(tableone)
@@ -17,11 +19,8 @@ set.seed(0)
 ADULT_SAMP_FREQ <- 200
 CHILD_SAMP_FREQ <- 256
 
-# ==========================================
-# 1. LOAD & CLEAN DATA
-# ==========================================
+## Preprocess cohorts ----
 
-## Process Adults Data
 adults_data <- adults_data_2025
 adults_data$coupling_label <- as.factor(adults_data$coupling_label)
 adults_data <- tibble::rowid_to_column(adults_data, "ID")
@@ -31,7 +30,6 @@ adults_data <- subset(adults_data, !grepl("O", channel))
 adults_data$channel <- sub("-M[12]$", "", adults_data$channel)
 adults_data$peakLoc <- adults_data$peakLoc / ADULT_SAMP_FREQ
 
-## Process Children Data
 children_data <- children_data_2025 
 children_data$coupling_label <- as.factor(children_data$coupling_label)
 children_data <- tibble::rowid_to_column(children_data, "ID")
@@ -41,34 +39,28 @@ children_data <- subset(children_data, !grepl("O", channel))
 children_data$channel <- sub("-M[12]$", "", children_data$channel)
 children_data$peakLoc <- children_data$peakLoc / CHILD_SAMP_FREQ
 
-# ==========================================
-# 2. TABLE ONE GENERATION
-# ==========================================
+## Descriptive tables ----
 
-# Adults Table
 adults_data_table <- adults_data[, 7:(ncol(adults_data))]
 vars <- colnames(adults_data_table)
 adults_tab_one <- CreateTableOne(vars = vars, data = adults_data_table, strata = "coupling_label")
 adults_table_matrix <- print(adults_tab_one, smd = TRUE, quote = FALSE, noSpaces = TRUE)
 
-# Children Table
 children_data_table <- children_data[, 7:(ncol(children_data))]
 children_tab_one <- CreateTableOne(vars = vars, data = children_data_table, strata = "coupling_label")
 children_table_matrix <- print(children_tab_one, smd = TRUE, quote = FALSE, noSpaces = TRUE)
 
-# ==========================================
-# 3. IDENTIFY CONTINUOUS VARIABLES
-# ==========================================
+## Continuous variables ----
+
 vars_continuous_adults <- names(adults_data_table)[sapply(adults_data_table, is.numeric)]
 vars_continuous_children <- names(children_data_table)[sapply(children_data_table, is.numeric)]
 
-# Use intersection of continuous variables present in both datasets
+# Use numeric variables present in both cohorts.
 vars_continuous <- intersect(vars_continuous_adults, vars_continuous_children)
 vars_continuous <- vars_continuous[vars_continuous != "coupling_label"] 
 
-# ==========================================
-# 4. SUMMARY DATA FRAMES & MERGING
-# ==========================================
+## Combined summary table ----
+
 adults_df <- as.data.frame(adults_table_matrix)
 children_df <- as.data.frame(children_table_matrix)
 
@@ -88,11 +80,9 @@ children_summary <- data.frame(
   stringsAsFactors = FALSE
 )
 
-# Merge the two summary data frames
 combined_summary_table <- merge(children_summary, adults_summary, by = "variable", all = TRUE)
 combined_summary_table <- combined_summary_table[!grepl("coupling_label =", combined_summary_table$variable), ]
 
-# Re-order columns
 final_table <- combined_summary_table[, c(
   "variable",
   "children_uncoupled_mean_std",
@@ -107,10 +97,9 @@ message("Saving combined summary table to 'combined_summary_table.csv'")
 write.csv(final_table, "combined_summary_table.csv", row.names = FALSE)
 print(head(final_table, 10))
 
-# ==========================================
-# 5. COMBINED SMD PLOT (RESTORED)
-# ==========================================
 message("Generating combined SMD plot...")
+
+## Standardized mean differences ----
 
 smd_adults <- ExtractSmd(adults_tab_one)
 smd_children <- ExtractSmd(children_tab_one)
@@ -146,9 +135,8 @@ combined_plot <- ggplot(data = dataPlot_combined,
 print(combined_plot)
 dev.off()
 
-# ==========================================
-# 6. MEAN VALUES (DUMBBELL) PLOT (RESTORED)
-# ==========================================
+## Mean value plot ----
+
 extract_mean <- function(x) { as.numeric(sub("^(.*) \\(.*", "\\1", x)) }
 
 mean_diff_adults_df <- final_table %>%
@@ -209,9 +197,8 @@ mean_vals_plot <- ggplot(data = combined_mean_vals_plot_data,
 print(mean_vals_plot)
 dev.off()
 
-# ==========================================
-# 7. SPINDLE DENSITY PLOTS (RESTORED)
-# ==========================================
+## Spindle density plot ----
+
 adults_data_with_group <- adults_data %>% mutate(Group = "Adults")
 children_data_with_group <- children_data %>% mutate(Group = "Children")
 combined_spindle_data <- rbind(children_data_with_group, adults_data_with_group)
